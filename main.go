@@ -58,7 +58,7 @@ func main() {
 	// Check if opaServer is responding
 	resp, err := http.Get("http://" + opaServer + "/health")
 	if err != nil || resp.StatusCode != http.StatusOK {
-		fmt.Println("OPA server is not responding")
+		fmt.Println("OPA server " + opaServer + " is not responding")
 		return
 	}
 	defer resp.Body.Close()

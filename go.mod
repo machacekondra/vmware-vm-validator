@@ -81,6 +81,6 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-replace github.com/konveyor/forklift-controller => github.com/machacekondra/forklift v0.0.0-20240730152029-a5f909315113
+replace github.com/konveyor/forklift-controller => github.com/kubev2v/forklift v0.0.0-20240729073638-8978e272380e
 
 go 1.22.4

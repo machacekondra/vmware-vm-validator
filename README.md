@@ -9,7 +9,7 @@ opa run --server ./validation/policies/io/konveyor/forklift/vmware
 2) Official forklift image
 ```
 # Note that we must override the entrypoint as it expects TLS cert.
-podman run -p 8181:8181 -d --name opa --entrypoint '/usr/bin/opa' quay.io/kubev2v/forklift-validation run --server /usr/share/opa/policies
+podman run -p 8181:8181 -d --name opa --entrypoint '/usr/bin/opa' quay.io/kubev2v/forklift-validation:release-v2.6.4 run --server /usr/share/opa/policies
 ```
 
 To run the validation execute:
@@ -23,6 +23,13 @@ go run main.go
 It will generate the validation per VM in the file ```/tmp/output.json```
 Path can be overriden by env variable `OUTPUT_FILE`.
 
+### Dependecy between binary and OPA server
+Note that podman container tag must match the dependency of `github.com/kubev2v/forklift`
+So always use for example:
+```
+go get github.com/kubev2v/forklift@release-v2.6.4
+podman run ... quay.io/kubev2v/forklift-validation@release-v.2.6.4
+```
 
 ### Ouput
 Example output:
