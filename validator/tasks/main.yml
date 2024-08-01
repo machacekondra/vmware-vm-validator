@@ -1,0 +1,13 @@
+- name: Run the validation
+  ansible.builtin.command: "{{ collector_path | mandatory }}/collector"
+  changed_when: false
+  environment:
+    OUTPUT_PATH: "{{ output_path }}"
+    VSPHERE_SERVER: "{{ vsphere_server | mandatory }}"
+    VSPHERE_USERNAME: "{{ vsphere_username | mandatory }}"
+    VSPHERE_PASSWORD: "{{ vsphere_password | mandatory }}"
+    OPA_SERVER: "{{ opa_server }}"
+
+- name: Print the result
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.file', output_path) }}"

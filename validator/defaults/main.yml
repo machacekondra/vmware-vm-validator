@@ -1,0 +1,2 @@
+output_path: "/tmp/output.json"
+opa_server: "127.0.0.1:8181"

@@ -1,0 +1,8 @@
+- hosts: localhost
+  gather_facts: false
+  connection: local
+
+  roles:
+    - name: Run virtual machine validator
+      role: validator
+
