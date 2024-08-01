@@ -8,7 +8,9 @@
     ports:
       - "8181:8181"
     command:
-      - "--server /usr/share/opa/policies"
+      - "run"
+      - "--server"
+      - "/usr/share/opa/policies"
 
 - name: Download collector binary
   ansible.builtin.get_url:
@@ -34,4 +36,3 @@
   containers.podman.podman_container:
     name: vmwarevalidator
     state: absent
-    force_delete: true

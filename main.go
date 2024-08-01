@@ -75,6 +75,7 @@ func main() {
 
 	// Vshere collector
 	collector := vsphere.New(db, provider, secret)
+	defer collector.DB().Close(true)
 	defer collector.Shutdown()
 
 	// Collect

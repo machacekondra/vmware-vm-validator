@@ -31,7 +31,6 @@ To execute the validation as part of Ansible, there is simple `validation` role.
 vsphere_server: "https://vcenter.example.com/sdk"
 vsphere_username: "administrator@vcenter.example.com"
 vsphere_password: "123456"
-collector_path: "/path/to/binary/of/collector"
 ```
 
 2) Execute the playbook
