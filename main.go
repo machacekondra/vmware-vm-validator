@@ -16,6 +16,7 @@ import (
 	vspheremodel "github.com/konveyor/forklift-controller/pkg/controller/provider/model/vsphere"
 	web "github.com/konveyor/forklift-controller/pkg/controller/provider/web/vsphere"
 	libmodel "github.com/konveyor/forklift-controller/pkg/lib/inventory/model"
+	apiplanner "github.com/kubev2v/migration-planner/api/v1alpha1"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -64,25 +65,244 @@ func main() {
 	defer resp.Body.Close()
 
 	// DB
-	path := filepath.Join("/tmp", "db.db")
-	models := model.Models(provider)
-	db := libmodel.New(path, models...)
-	err = db.Open(true)
+	db, err := createDB(provider)
+	if err != nil {
+		fmt.Println("Error creating DB.", err)
+		return
+	}
+
+	// Vshere collector
+	collector, err := createCollector(db, provider, secret)
+	if err != nil {
+		fmt.Println("Error creating collector.", err)
+		return
+	}
+	defer collector.DB().Close(true)
+	defer collector.Shutdown()
+
+	// List VMs
+	vms := &[]vspheremodel.VM{}
+	err = collector.DB().List(vms, libmodel.FilterOptions{Detail: 1})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	hosts := &[]vspheremodel.Host{}
+	err = collector.DB().List(hosts, libmodel.FilterOptions{Detail: 1})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	clusters := &[]vspheremodel.Cluster{}
+	err = collector.DB().List(clusters, libmodel.FilterOptions{Detail: 1})
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	// Vshere collector
-	collector := vsphere.New(db, provider, secret)
-	defer collector.DB().Close(true)
-	defer collector.Shutdown()
+	// Create inventory
+	inv := &apiplanner.Inventory{
+		Vms: apiplanner.VMs{
+			Total:       len(*vms),
+			PowerStates: map[string]int{},
+			Os:          map[string]int{},
+		},
+		Infra: apiplanner.Infra{
+			Datastores:      getDatastores(collector),
+			HostPowerStates: getHostPowerStates(*hosts),
+			TotalHosts:      len(*hosts),
+			TotalClusters:   len(*clusters),
+			HostsPerCluster: getHostsPerCluster(*clusters),
+			Networks:        getNetworks(collector),
+		},
+	}
 
-	// Collect
-	err = collector.Start()
+	// Run the validation of VMs
+	vms, err = validation(vms, opaServer)
 	if err != nil {
 		fmt.Println(err)
 		return
+	}
+
+	// Transform VM data to inventory.json
+	for _, vm := range *vms {
+		migrationReport(vm.Concerns, inv)
+		inv.Vms.Os[vm.GuestName]++
+		inv.Vms.PowerStates[vm.PowerState]++
+
+		// CPU
+		inv.Vms.CpuCores.Total += int(vm.CpuCount)
+		if !isMigratable(vm) {
+			inv.Vms.CpuCores.TotalForNotMigratable += int(vm.CpuCount)
+		} else {
+			if isMigratebleWithWarning(vm) {
+				inv.Vms.CpuCores.TotalForMigratableWithWarnings += int(vm.CpuCount)
+			} else {
+				inv.Vms.CpuCores.TotalForMigratable += int(vm.CpuCount)
+			}
+		}
+
+		// RAM
+		inv.Vms.RamGB.Total += int(vm.MemoryMB / 1024)
+		if !isMigratable(vm) {
+			inv.Vms.RamGB.TotalForNotMigratable += int(vm.MemoryMB / 1024)
+		} else {
+			if isMigratebleWithWarning(vm) {
+				inv.Vms.RamGB.TotalForMigratableWithWarnings += int(vm.MemoryMB / 1024)
+			} else {
+				inv.Vms.RamGB.TotalForMigratable += int(vm.MemoryMB / 1024)
+			}
+		}
+
+		// DiskCount
+		inv.Vms.DiskCount.Total += len(vm.Disks)
+		if !isMigratable(vm) {
+			inv.Vms.DiskCount.TotalForNotMigratable += len(vm.Disks)
+		} else {
+			if isMigratebleWithWarning(vm) {
+				inv.Vms.DiskCount.TotalForMigratableWithWarnings += len(vm.Disks)
+			} else {
+				inv.Vms.DiskCount.TotalForMigratable += len(vm.Disks)
+			}
+		}
+
+		// DiskGB
+		inv.Vms.DiskGB.Total += totalCapacity(vm.Disks)
+		if !isMigratable(vm) {
+			inv.Vms.DiskGB.TotalForNotMigratable += totalCapacity(vm.Disks)
+		} else {
+			if isMigratebleWithWarning(vm) {
+				inv.Vms.DiskGB.TotalForMigratableWithWarnings += totalCapacity(vm.Disks)
+			} else {
+				inv.Vms.DiskGB.TotalForMigratable += totalCapacity(vm.Disks)
+			}
+		}
+	}
+
+	// Write the inventory to output file:
+	if err := createOuput(outputFile, inv); err != nil {
+		fmt.Println("Error writing output:", err)
+		return
+	}
+}
+
+func isMigratable(vm vspheremodel.VM) bool {
+	for _, c := range vm.Concerns {
+		if c.Category == "Critical" {
+			return false
+		}
+	}
+	return true
+}
+
+func isMigratebleWithWarning(vm vspheremodel.VM) bool {
+	for _, c := range vm.Concerns {
+		if c.Category == "Warning" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func getNetworks(collector *vsphere.Collector) []struct {
+	Name string                       `json:"name"`
+	Type apiplanner.InfraNetworksType `json:"type"`
+} {
+	r := []struct {
+		Name string                       `json:"name"`
+		Type apiplanner.InfraNetworksType `json:"type"`
+	}{}
+	networks := &[]vspheremodel.Network{}
+	err := collector.DB().List(networks, libmodel.FilterOptions{Detail: 1})
+	if err != nil {
+		return nil
+	}
+	for _, n := range *networks {
+		r = append(r, struct {
+			Name string                       `json:"name"`
+			Type apiplanner.InfraNetworksType `json:"type"`
+		}{Name: n.Name, Type: apiplanner.InfraNetworksType(n.DVSwitch.Kind)})
+	}
+
+	return r
+}
+
+func getHostsPerCluster(clusters []vspheremodel.Cluster) []int {
+	res := []int{}
+	for _, c := range clusters {
+		res = append(res, len(c.Hosts))
+	}
+	return res
+}
+
+func getHostPowerStates(hosts []vspheremodel.Host) map[string]int {
+	states := map[string]int{}
+
+	for _, host := range hosts {
+		states[host.Status]++
+	}
+
+	return states
+}
+
+func getDatastores(collector *vsphere.Collector) []struct {
+	FreeCapacityGB  int    `json:"freeCapacityGB"`
+	TotalCapacityGB int    `json:"totalCapacityGB"`
+	Type            string `json:"type"`
+} {
+	datastores := &[]vspheremodel.Datastore{}
+	err := collector.DB().List(datastores, libmodel.FilterOptions{Detail: 1})
+	if err != nil {
+		return nil
+	}
+	res := []struct {
+		FreeCapacityGB  int    `json:"freeCapacityGB"`
+		TotalCapacityGB int    `json:"totalCapacityGB"`
+		Type            string `json:"type"`
+	}{}
+	for _, ds := range *datastores {
+		res = append(res, struct {
+			FreeCapacityGB  int    `json:"freeCapacityGB"`
+			TotalCapacityGB int    `json:"totalCapacityGB"`
+			Type            string `json:"type"`
+		}{TotalCapacityGB: int(ds.Capacity / 1024 / 1024 / 1024), FreeCapacityGB: int(ds.Free / 1024 / 1024 / 1024), Type: ds.Type})
+	}
+
+	return res
+}
+
+func totalCapacity(disks []vspheremodel.Disk) int {
+	total := 0
+	for _, d := range disks {
+		total += int(d.Capacity)
+	}
+	return total / 1024 / 1024 / 1024
+}
+
+func hasLabel(
+	reasons []struct {
+		Assessment string `json:"assessment"`
+		Count      int    `json:"count"`
+		Label      string `json:"label"`
+	},
+	label string,
+) int {
+	for i, reason := range reasons {
+		if label == reason.Label {
+			return i
+		}
+	}
+	return -1
+}
+
+func createCollector(db libmodel.DB, provider *api.Provider, secret *core.Secret) (*vsphere.Collector, error) {
+	collector := vsphere.New(db, provider, secret)
+
+	// Collect
+	err := collector.Start()
+	if err != nil {
+		return nil, err
 	}
 
 	// Wait for collector.
@@ -92,16 +312,44 @@ func main() {
 			break
 		}
 	}
+	return collector, nil
+}
 
-	// List VMs
-	vms := &[]vspheremodel.VM{}
-	err = collector.DB().List(vms, libmodel.FilterOptions{})
+func createDB(provider *api.Provider) (libmodel.DB, error) {
+	path := filepath.Join("/tmp", "db.db")
+	models := model.Models(provider)
+	db := libmodel.New(path, models...)
+	err := db.Open(true)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
+	}
+	return db, nil
+}
+
+func createOuput(outputFile string, inv *apiplanner.Inventory) error {
+	// Create or open the file
+	file, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	// Ensure the file is closed properly
+	defer file.Close()
+
+	// Write the string to the file
+	jsonData, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(jsonData)
+	if err != nil {
+		return err
 	}
 
-	vmReport := make(map[string]interface{})
+	return nil
+}
+
+func validation(vms *[]vspheremodel.VM, opaServer string) (*[]vspheremodel.VM, error) {
+	res := []vspheremodel.VM{}
 	for _, vm := range *vms {
 		// Prepare the JSON data to MTV OPA server format.
 		r := web.Workload{}
@@ -112,8 +360,7 @@ func main() {
 
 		vmData, err := json.Marshal(vmJson)
 		if err != nil {
-			fmt.Println(err)
-			return
+			return nil, err
 		}
 
 		// Prepare the HTTP request to OPA server
@@ -123,8 +370,7 @@ func main() {
 			bytes.NewBuffer(vmData),
 		)
 		if err != nil {
-			fmt.Println("Error creating HTTP request:", err)
-			return
+			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -132,56 +378,90 @@ func main() {
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
-			fmt.Println("Error sending HTTP request:", err)
-			vmReport[vm.Name] = map[string]interface{}{"failed": true}
 			continue
 		}
 
 		// Check the response status
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Received non-OK response: %s\n", resp.Status)
-			vmReport[vm.Name] = map[string]interface{}{"failed": true}
-			return
+			return nil, fmt.Errorf("invalid status code")
 		}
 
 		// Read the response body
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Println("Error reading response body:", err)
-			vmReport[vm.Name] = map[string]interface{}{"failed": true}
-			return
+			return nil, err
 		}
 
 		// Save the report to map
-		var responseMap map[string]interface{}
-		err = json.Unmarshal(body, &responseMap)
+		var vmValidation VMValidation
+		err = json.Unmarshal(body, &vmValidation)
 		if err != nil {
-			fmt.Println("Error unmarshalling response body:", err)
-			vmReport[vm.Name] = map[string]interface{}{"failed": true}
-			return
+			return nil, err
 		}
-		vmReport[vm.Name] = responseMap
+		for _, c := range vmValidation.Result {
+			vm.Concerns = append(vm.Concerns, vspheremodel.Concern{Label: c.Label, Assessment: c.Assessment, Category: c.Category})
+		}
 		resp.Body.Close()
+		res = append(res, vm)
 	}
+	return &res, nil
+}
 
-	// Create or open the file
-	file, err := os.Create(outputFile)
-	if err != nil {
-		fmt.Println("Error creating file:", err)
-		return
+func migrationReport(concern []vspheremodel.Concern, inv *apiplanner.Inventory) {
+	migratable := true
+	hasWarning := false
+	for _, result := range concern {
+		if result.Category == "Critical" {
+			migratable = false
+			if i := hasLabel(inv.Vms.NotMigratableReasons, result.Label); i >= 0 {
+				inv.Vms.NotMigratableReasons[i].Count++
+			} else {
+				inv.Vms.NotMigratableReasons = append(inv.Vms.NotMigratableReasons, NotMigratableReason{
+					Label:      result.Label,
+					Count:      0,
+					Assessment: result.Assessment,
+				})
+			}
+		}
+		if result.Category == "Warning" {
+			hasWarning = true
+			if i := hasLabel(inv.Vms.MigrationWarnings, result.Label); i >= 0 {
+				inv.Vms.MigrationWarnings[i].Count++
+			} else {
+				inv.Vms.MigrationWarnings = append(inv.Vms.MigrationWarnings, NotMigratableReason{
+					Label:      result.Label,
+					Count:      0,
+					Assessment: result.Assessment,
+				})
+			}
+		}
 	}
-	// Ensure the file is closed properly
-	defer file.Close()
+	if hasWarning {
+		if inv.Vms.TotalMigratableWithWarnings == nil {
+			total := 0
+			inv.Vms.TotalMigratableWithWarnings = &total
+		}
+		*inv.Vms.TotalMigratableWithWarnings++
+	}
+	if migratable {
+		inv.Vms.TotalMigratable++
+	}
+}
 
-	// Write the string to the file
-	jsonData, err := json.Marshal(vmReport)
-	if err != nil {
-		fmt.Println("Error marshalling JSON:", err)
-		return
-	}
-	_, err = file.Write(jsonData)
-	if err != nil {
-		fmt.Println("Error writing to file:", err)
-		return
-	}
+type NotMigratableReasons []NotMigratableReason
+
+type NotMigratableReason struct {
+	Assessment string `json:"assessment"`
+	Count      int    `json:"count"`
+	Label      string `json:"label"`
+}
+
+type VMResult struct {
+	Assessment string `json:"assessment"`
+	Category   string `json:"category"`
+	Label      string `json:"label"`
+}
+
+type VMValidation struct {
+	Result []VMResult `json:"result"`
 }

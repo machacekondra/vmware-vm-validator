@@ -23,20 +23,6 @@ go run main.go
 It will generate the validation per VM in the file ```/tmp/output.json```
 Path can be overriden by env variable `OUTPUT_FILE`.
 
-### Ansible execution
-To execute the validation as part of Ansible, there is simple `validation` role.
-
-1) Create `.creds` file with credentials
-```
-vsphere_server: "https://vcenter.example.com/sdk"
-vsphere_username: "administrator@vcenter.example.com"
-vsphere_password: "123456"
-```
-
-2) Execute the playbook
-```
-ansible-playbook -e @.creds validation.yml
-```
 
 ### Dependecy between binary and OPA server
 Note that podman container tag must match the dependency of `github.com/kubev2v/forklift`
