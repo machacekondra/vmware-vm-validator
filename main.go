@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	api "github.com/konveyor/forklift-controller/pkg/apis/forklift/v1beta1"
@@ -125,7 +127,18 @@ func main() {
 	}
 
 	// Transform VM data to inventory.json
+	cpuSet := []int{}
+	memorySet := []int{}
+	diskGBSet := []int{}
+	diskCountSet := []int{}
 	for _, vm := range *vms {
+		// histogram collection
+		cpuSet = append(cpuSet, int(vm.CpuCount))
+		memorySet = append(memorySet, int(vm.MemoryMB/1024))
+		diskGBSet = append(diskGBSet, totalCapacity(vm.Disks))
+		diskCountSet = append(diskCountSet, len(vm.Disks))
+
+		// inventory
 		migrationReport(vm.Concerns, inv)
 		inv.Vms.Os[vm.GuestName]++
 		inv.Vms.PowerStates[vm.PowerState]++
@@ -179,10 +192,53 @@ func main() {
 		}
 	}
 
+	// Histogram
+	inv.Vms.CpuCores.Histogram = histogram(cpuSet)
+	inv.Vms.RamGB.Histogram = histogram(memorySet)
+	inv.Vms.DiskCount.Histogram = histogram(diskCountSet)
+	inv.Vms.DiskGB.Histogram = histogram(diskGBSet)
+
 	// Write the inventory to output file:
 	if err := createOuput(outputFile, inv); err != nil {
 		fmt.Println("Error writing output:", err)
 		return
+	}
+}
+
+func histogram(d []int) struct {
+	Data     []int `json:"data"`
+	MinValue int   `json:"minValue"`
+	Step     int   `json:"step"`
+} {
+	minVal := slices.Min(d)
+	maxVal := slices.Max(d)
+
+	// Calculate the range of values, number of data points, number of bins, and bin size
+	rangeValues := maxVal - minVal
+	numberOfDataPoints := len(d)
+	numberOfBins := int(math.Sqrt(float64(numberOfDataPoints)))
+	binSize := float64(rangeValues) / float64(numberOfBins)
+
+	// Initialize the bins with 0s
+	bins := make([]int, numberOfBins)
+
+	// Fill the bins based on data points
+	for _, data := range d {
+		binIndex := int(float64(data-minVal) / binSize)
+		if binIndex == numberOfBins {
+			binIndex--
+		}
+		bins[binIndex]++
+	}
+
+	return struct {
+		Data     []int `json:"data"`
+		MinValue int   `json:"minValue"`
+		Step     int   `json:"step"`
+	}{
+		Data:     bins,
+		Step:     int(math.Round(binSize)),
+		MinValue: minVal,
 	}
 }
 
